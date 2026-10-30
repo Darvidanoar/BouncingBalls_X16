@@ -40,10 +40,12 @@
 ;    floor it bounces without losing any energy, so it keeps any height it
 ;    gained from a collision (see bounce_y).
 ;
-; 5. Collisions: two balls touch when their centres are closer than one ball
-;    width. When they touch, they swap speeds along the direction they hit
-;    in. That is what happens when two equal balls collide (think of
-;    snooker balls). See check_collision for the details.
+; 5. Collisions: VERA does the detecting for us. Both sprites are given the
+;    same collision mask, and whenever their non-transparent pixels overlap
+;    in a frame, VERA sets that mask's bit in its ISR register. Only then do
+;    we run check_collision, which makes the balls swap speeds along the
+;    direction they hit in. That is what happens when two equal balls
+;    collide (think of snooker balls). See check_collision for the details.
 ;
 ; 6. Everything runs once per video frame (60 times a second). We wait for
 ;    the start of each frame by watching the KERNAL's jiffy clock, which the
@@ -161,6 +163,7 @@ CLR_SCREEN    = $93         ; PETSCII "clear screen" character
 
 ; ---- Sprite attribute bits (VRAM_sprattr + 8*n, see "init_sprites") -------
 SPR_8BPP      = %10000000   ; byte 1: 8 bits per pixel (else 4)
+SPR_COLLIDE   = %00010000   ; byte 6: collision mask (bits 7-4), group 0
 SPR_Z_FRONT   = %00001100   ; byte 6: Z depth 3 = in front of both layers
 SPR_32X32     = %10100000   ; byte 7: height (bits 7-6) and width (bits 5-4)
                             ;   size codes: 0 = 8, 1 = 16, 2 = 32, 3 = 64 pixels
@@ -269,8 +272,17 @@ main_loop:
     jsr draw_balls          ; sprite positions
     jsr spin_balls          ; palette cycling
 
+    ; Did the balls touch in the frame VERA just finished drawing? At the
+    ; start of each vertical blank VERA puts the collision masks of any
+    ; overlapping sprites in the top 4 bits of ISR. We only need to work out
+    ; the bounce when that has happened.
+    lda VERA_isr
+    and #SPR_COLLIDE
+    beq @no_hit
+    jsr check_collision     ; work out how they bounce
+@no_hit:
+
     jsr move_balls          ; physics for the next frame
-    jsr check_collision     ; did they hit each other?
 
     jsr GETIN               ; A = key pressed, or 0 if none
     beq main_loop           ; no key: keep going
@@ -486,7 +498,7 @@ copy_ball_image:
 ;   1: bit 7 = colour mode (1 = 8bpp), bits 3-0 = image address bits 16-13
 ;   2: X position bits 7-0          3: X position bits 9-8
 ;   4: Y position bits 7-0          5: Y position bits 9-8
-;   6: collision mask, Z depth (bits 3-2), V flip, H flip
+;   6: collision mask (bits 7-4), Z depth (bits 3-2), V flip, H flip
 ;   7: height (bits 7-6), width (bits 5-4), palette offset (bits 3-0)
 ; The image address is stored divided by 32, so sprite images must start on
 ; a 32 byte boundary.
@@ -507,7 +519,7 @@ init_sprites:
     stz VERA_data0
     stz VERA_data0
     stz VERA_data0
-    lda #SPR_Z_FRONT
+    lda #(SPR_COLLIDE | SPR_Z_FRONT) ; same mask on both: VERA flags overlaps
     sta VERA_data0
     lda #SPR_32X32
     sta VERA_data0
@@ -874,6 +886,11 @@ reverse_x:
 
 ;==============================================================================
 ; check_collision - make the two balls bounce off each other.
+;
+; Only called when VERA has reported that the sprites overlapped (see
+; main_loop). VERA's report is about the frame it has just drawn, and it
+; counts any overlapping pixels, so we still check the distance ourselves
+; using the balls' current positions.
 ;
 ; 1. DETECT. The balls touch when the distance between their centres is less
 ;    than COLLIDE_DIST (32). By Pythagoras that distance is

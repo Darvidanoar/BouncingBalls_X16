@@ -39,7 +39,7 @@ On real hardware, copy `BOING.PRG` to the SD card, then `LOAD "BOING.PRG"` and `
 - **Balls:** each ball is a 32x32 hardware sprite. Moving a ball only means writing a new X/Y position into the sprite's attributes. The ball is never redrawn.
 - **Spinning:** palette cycling, the same trick the original 1984 Amiga demo used. Each pixel's palette entry stands for one thin slice of the ball's surface. Every frame those entries are recoloured red or white, shifted by one slice, so the checkers seem to roll. The blue ball uses the same image with a separate set of 64 palette entries.
 - **Gravity:** 8.8 fixed-point maths. Each frame a small constant is added to a ball's vertical speed, and the speed is added to its position, which gives a parabola. Floor bounces lose no energy.
-- **Collisions:** when the balls' centres are closer than one ball width, they swap speeds along the direction they hit in, as two equal snooker balls would.
+- **Collisions:** both sprites share a VERA collision mask, so VERA's sprite renderer flags any frame where their pixels overlap. Only then does the program check the distance between the balls and swap their speeds along the direction they hit in, as two equal snooker balls would.
 - **Timing:** everything runs once per frame (60 Hz), synced to the KERNAL's jiffy clock.
 
 `BOING.ASM` has detailed comments explaining all of this.
