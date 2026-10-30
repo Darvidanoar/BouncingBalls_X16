@@ -1,0 +1,4 @@
+# Build output (regenerate with make)
+*.PRG
+*.LIST
+*.o
