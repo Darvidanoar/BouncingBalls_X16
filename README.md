@@ -2,7 +2,7 @@
 
 Amiga-style "Boing" balls for the [Commander X16](https://www.commanderx16.com/), written in 65C02 assembly.
 
-A red and a blue checkered ball bounce around the screen under gravity, spinning as they go, in front of the classic purple grid. When the balls meet they bounce off each other. Press any key to return to BASIC.
+Red, blue and green checkered balls bounce around the screen under gravity, spinning as they go, in front of the classic purple grid. When two balls meet they bounce off each other. Press any key to return to BASIC.
 
 ## Requirements
 
@@ -37,9 +37,9 @@ On real hardware, copy `BOING.PRG` to the SD card, then `LOAD "BOING.PRG"` and `
 
 - **Background:** layer 1 of the VERA video chip is a tile map where every tile is the same 16x16 grid square.
 - **Balls:** each ball is a 32x32 hardware sprite. Moving a ball only means writing a new X/Y position into the sprite's attributes. The ball is never redrawn.
-- **Spinning:** palette cycling, the same trick the original 1984 Amiga demo used. Each pixel's palette entry stands for one thin slice of the ball's surface. Every frame those entries are recoloured red or white, shifted by one slice, so the checkers seem to roll. The blue ball uses the same image with a separate set of 64 palette entries.
+- **Spinning:** palette cycling, the same trick the original 1984 Amiga demo used. Each pixel's palette entry stands for one thin slice of the ball's surface. Every frame those entries are recoloured red or white, shifted by one slice, so the checkers seem to roll. The blue and green balls use the same image, each with its own set of 64 palette entries. VERA's 256-entry palette only has room for 3 balls done this way.
 - **Gravity:** 8.8 fixed-point maths. Each frame a small constant is added to a ball's vertical speed, and the speed is added to its position, which gives a parabola. Floor bounces lose no energy.
-- **Collisions:** both sprites share a VERA collision mask, so VERA's sprite renderer flags any frame where their pixels overlap. Only then does the program check the distance between the balls and swap their speeds along the direction they hit in, as two equal snooker balls would.
+- **Collisions:** all the sprites share a VERA collision mask, so VERA's sprite renderer flags any frame where balls overlap. VERA doesn't say which ones, so only then does the program check the distance between every pair of balls and make any that touch swap their speeds along the direction they hit in, as two equal snooker balls would.
 - **Timing:** everything runs once per frame (60 Hz), synced to the KERNAL's jiffy clock.
 
 `BOING.ASM` has detailed comments explaining all of this.
@@ -58,8 +58,8 @@ On real hardware, copy `BOING.PRG` to the SD card, then `LOAD "BOING.PRG"` and `
 
 The starting speeds are constants near the top of `BOING.ASM`:
 
-- `RED_SPEED_X` / `BLUE_SPEED_X`: sideways speed. Keep it below `$0800`.
-- `RED_BOUNCE` / `BLUE_BOUNCE`: launch speed, which sets bounce height. Above `$0600` a ball hits the ceiling.
+- `RED_SPEED_X` / `BLUE_SPEED_X` / `GREEN_SPEED_X`: sideways speed. Keep it below `$0800`.
+- `RED_BOUNCE` / `BLUE_BOUNCE` / `GREEN_BOUNCE`: launch speed, which sets bounce height. Above `$0600` a ball hits the ceiling.
 - `GRAVITY`: added to the vertical speed every frame.
 
 All of these are 8.8 fixed point, so `$0100` is 1 pixel per frame.

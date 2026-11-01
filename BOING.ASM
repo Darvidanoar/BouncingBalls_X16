@@ -1,9 +1,9 @@
 ;******************************************************************************
 ; BOING.ASM - Amiga-style "Boing" balls for the Commander X16
 ;
-; A red and a blue checkered ball bounce around the screen under gravity,
-; spinning as they go, in front of the classic purple grid. When the balls
-; meet they bounce off each other. Press any key to return to BASIC.
+; Red, blue and green checkered balls bounce around the screen under
+; gravity, spinning as they go, in front of the classic purple grid. When two
+; balls meet they bounce off each other. Press any key to return to BASIC.
 ;
 ; Build:   make
 ;          (or: cl65 -t cx16 -C cx16-asm.cfg -u __EXEHDR__ -o BOING.PRG BOING.ASM)
@@ -30,8 +30,8 @@
 ;    a palette entry that stands for one thin slice of the ball's surface
 ;    (see gen_ball.py). Each frame we recolour those entries red or white,
 ;    shifted by one slice, so the checkers seem to roll around the ball.
-;    The blue ball is the same picture using a different set of 64 palette
-;    entries, so it can be coloured and spun separately.
+;    The blue and green balls are the same picture, each using its own set
+;    of 64 palette entries, so every ball can be coloured and spun separately.
 ;
 ; 4. Gravity: each ball has a vertical speed (vel_y). Every frame we add a
 ;    small constant (GRAVITY) to that speed, then add the speed to the
@@ -41,11 +41,13 @@
 ;    gained from a collision (see bounce_y).
 ;
 ; 5. Collisions: VERA does the detecting for us. Both sprites are given the
-;    same collision mask, and whenever their non-transparent pixels overlap
-;    in a frame, VERA sets that mask's bit in its ISR register. Only then do
-;    we run check_collision, which makes the balls swap speeds along the
-;    direction they hit in. That is what happens when two equal balls
-;    collide (think of snooker balls). See check_collision for the details.
+;    same collision mask, and whenever any of their non-transparent pixels
+;    overlap in a frame, VERA sets that mask's bit in its ISR register. VERA
+;    doesn't say WHICH sprites overlapped, so only then do we run
+;    check_collisions, which tests every pair of balls and makes any that
+;    touch swap speeds along the direction they hit in. That is what happens
+;    when two equal balls collide (think of snooker balls). See check_pair
+;    for the details.
 ;
 ; 6. Everything runs once per video frame (60 times a second). We wait for
 ;    the start of each frame by watching the KERNAL's jiffy clock, which the
@@ -76,13 +78,12 @@
 ; table with one byte per ball, and the X register says which ball we are
 ; working on:
 ;
-;     lda pos_y,x         ; X = 0: the red ball's Y,  X = 1: the blue ball's
+;     lda pos_y,x         ; X = 0: red ball's Y, 1: blue ball's, 2: green's
 ;
 ; The bytes of a multi-byte number are kept in separate tables
 ; (pos_y_frac for the fraction, pos_y for the whole pixels) so that one
-; X value finds every part of it. Where the code only ever deals with
-; balls 0 and 1 together, it uses "pos_y" for ball 0 and "pos_y+1" for
-; ball 1: the assembler just adds 1 to the address.
+; X value finds every part of it. Where the code deals with a pair of balls
+; (check_pair) it uses X for one ball and Y for the other.
 ;******************************************************************************
 
 .include "INC/x16.inc"      ; X16 register names, KERNAL calls, VERA_SET_ADDR
@@ -91,7 +92,7 @@
 ; CONSTANTS
 ;==============================================================================
 
-NUM_BALLS     = 2           ; ball 0 = red, ball 1 = blue
+NUM_BALLS     = 3           ; ball 0 = red, ball 1 = blue, ball 2 = green
 
 ; ---- Where things live in video memory (VRAM) -------------------------------
 ; The X16 has 128KB of VRAM ($00000-$1FFFF) that belongs to the VERA chip.
@@ -101,6 +102,7 @@ BALL_BYTES    = BALL_SIZE * BALL_SIZE   ; 8bpp: one byte per pixel = 1024
 
 BALL0_VRAM    = $10000                  ; red ball's pixels
 BALL1_VRAM    = BALL0_VRAM + BALL_BYTES ; blue ball's pixels ($10400)
+BALL2_VRAM    = BALL1_VRAM + BALL_BYTES ; green ball's pixels ($10800)
 TILE_VRAM     = $12000      ; the grid tile (16x16, 4bpp = 128 bytes)
                             ;   tile data must start on a 2KB boundary
 MAP_VRAM      = $12800      ; tile map (32x32 entries * 2 bytes = 2KB)
@@ -112,7 +114,9 @@ MAP_VRAM      = $12800      ; tile map (32x32 entries * 2 bytes = 2KB)
 ;   17       grid background (grey)
 ;   18       grid lines (purple)
 ;   32-95    the red ball:  4 shades * 16 slices (see gen_ball.py)
-;   96-159   the blue ball: the same layout, 64 entries further on
+;   96-159   the blue ball:  the same layout, 64 entries further on
+;   160-223  the green ball: 64 entries further on again
+; 256 entries only leave room for 3 balls with their own colours and spin.
 GRID_PAL_OFFSET = 1         ; the tile uses palette block 1 (entries 16-31)
 BALL_PAL_BASE   = 32        ; first ball entry  (must match gen_ball.py)
 BALL_SLICES     = 16        ; slices per checker pair (must match gen_ball.py)
@@ -145,14 +149,16 @@ GRAVITY       = $0018       ; 0.09375 pixels per frame, added to vel_y each fram
 RED_SPEED_X   = $0140       ; $0140=1.25 pixels per frame
 RED_BOUNCE    = $0500       ; $0500=5.0  -> bounces about 133 pixels high
 BLUE_SPEED_X  = $00C0       ; $00C0=0.75 pixels per frame
-BLUE_BOUNCE   = $0440       ; $0400=4.25 -> bounces about 96 pixels high
+BLUE_BOUNCE   = $0440       ; $0440=4.25 -> bounces about 96 pixels high
+GREEN_SPEED_X = $00A0       ; $00A0=0.625 pixels per frame
+GREEN_BOUNCE  = $0580       ; $0580=5.5  -> bounces about 161 pixels high
 ;
 ; These only set how the balls START. Collisions swap speeds between the
 ; balls (that's what equal balls do when they hit), passing energy from one
-; to the other: after a side-on collision the red ball moves at the blue
-; ball's sideways speed and vice versa, and a ball knocked upwards keeps
-; bouncing higher until another collision changes it again. The total
-; energy of the two balls never changes.
+; to the other: after a side-on collision between the red and blue balls the
+; red one moves at the blue one's sideways speed and vice versa, and a ball
+; knocked upwards keeps bouncing higher until another collision changes it
+; again. The total energy of all the balls never changes.
 
 ; Two balls touch when their centres are closer than this (two radii).
 COLLIDE_DIST  = BALL_SIZE
@@ -195,17 +201,20 @@ spin_phase:   .res NUM_BALLS  ; 0-15: how far the checkers have rolled
 old_y_frac:   .res 1        ; the ball's Y before this frame's move
 old_y:        .res 1
 
-; ---- Used by check_collision -----------------------------------------------
-dx_lo:        .res 1        ; dx = ball 1's X - ball 0's X  (16-bit signed)
+; ---- Used by check_collisions / check_pair ----------------------------------
+ball_a:       .res 1        ; the pair being checked: ball_a < ball_b
+ball_b:       .res 1
+swap_tmp:     .res 1        ; holds one byte while two speeds are swapped
+dx_lo:        .res 1        ; dx = ball b's X - ball a's X  (16-bit signed)
 dx_hi:        .res 1
-dy_lo:        .res 1        ; dy = ball 1's Y - ball 0's Y  (16-bit signed)
+dy_lo:        .res 1        ; dy = ball b's Y - ball a's Y  (16-bit signed)
 dy_hi:        .res 1
 dist_x:       .res 1        ; |dx| (size without the sign)
 dist_y:       .res 1        ; |dy|
 dist_sq:      .res 2        ; dx*dx + dy*dy
 
 ; ---- Other ------------------------------------------------------------------
-phase:        .res 1        ; used by spin_ball
+phase:        .res 1        ; used by spin_balls
 last_jiffy:   .res 1        ; used by wait_frame
 old_mode:     .res 1        ; screen mode to restore on exit
 old_l1_config:   .res 1     ; layer 1 settings to restore on exit
@@ -272,14 +281,14 @@ main_loop:
     jsr draw_balls          ; sprite positions
     jsr spin_balls          ; palette cycling
 
-    ; Did the balls touch in the frame VERA just finished drawing? At the
+    ; Did any balls touch in the frame VERA just finished drawing? At the
     ; start of each vertical blank VERA puts the collision masks of any
     ; overlapping sprites in the top 4 bits of ISR. We only need to work out
-    ; the bounce when that has happened.
+    ; the bounces when that has happened.
     lda VERA_isr
     and #SPR_COLLIDE
     beq @no_hit
-    jsr check_collision     ; work out how they bounce
+    jsr check_collisions    ; find which balls touched and bounce them
 @no_hit:
 
     jsr move_balls          ; physics for the next frame
@@ -441,22 +450,27 @@ init_background:
     rts
 
 ;==============================================================================
-; init_sprite_pixels - put both ball images into VRAM.
+; init_sprite_pixels - put every ball's image into VRAM.
 ;
 ; There is only one ball picture (ball_pixels). The red ball gets it as it
-; is. For the blue ball we add BALL_PAL_SIZE (64) to every non-transparent
-; pixel, so it uses palette entries 96-159 instead of 32-95, and spin_balls
-; can colour those entries blue.
+; is. For each later ball we add another BALL_PAL_SIZE (64) to every
+; non-transparent pixel, so the blue ball uses palette entries 96-159, the
+; green ball 160-223, and spin_balls can colour each set separately.
+;
+; The images sit one after another in VRAM, and VERA's address carries on
+; from where the last copy stopped, so we only set it once.
 ;==============================================================================
 init_sprite_pixels:
     VERA_SET_ADDR BALL0_VRAM, 1
     stz colour_shift        ; red ball: unchanged
+@loop:
     jsr copy_ball_image
-
-    VERA_SET_ADDR BALL1_VRAM, 1
-    lda #BALL_PAL_SIZE      ; blue ball: 64 palette entries further on
+    lda colour_shift        ; next ball: 64 palette entries further on
+    clc
+    adc #BALL_PAL_SIZE
     sta colour_shift
-    jsr copy_ball_image
+    cmp #(BALL_PAL_SIZE * NUM_BALLS)
+    bne @loop               ; until every ball has its image
     rts
 
 ;------------------------------------------------------------------------------
@@ -491,7 +505,7 @@ copy_ball_image:
     rts
 
 ;==============================================================================
-; init_sprites - fill in the attributes of sprites 0 and 1 (the balls).
+; init_sprites - fill in the attributes of sprites 0-2 (the balls).
 ;
 ; Each sprite has 8 bytes of attributes at $1FC00 + 8*sprite number:
 ;   0: image address bits 12-5
@@ -503,8 +517,8 @@ copy_ball_image:
 ; The image address is stored divided by 32, so sprite images must start on
 ; a 32 byte boundary.
 ;
-; Sprite 1's attributes follow straight on from sprite 0's, so we can write
-; all 16 bytes without moving the VRAM address.
+; Each sprite's attributes follow straight on from the one before, so we can
+; write all of them without moving the VRAM address.
 ;==============================================================================
 init_sprites:
     VERA_SET_ADDR VRAM_sprattr, 1
@@ -519,7 +533,7 @@ init_sprites:
     stz VERA_data0
     stz VERA_data0
     stz VERA_data0
-    lda #(SPR_COLLIDE | SPR_Z_FRONT) ; same mask on both: VERA flags overlaps
+    lda #(SPR_COLLIDE | SPR_Z_FRONT) ; same mask on all: VERA flags overlaps
     sta VERA_data0
     lda #SPR_32X32
     sta VERA_data0
@@ -529,14 +543,19 @@ init_sprites:
     rts
 
 ; Attribute bytes 0 and 1 for each ball: image address / 32, plus 8bpp mode.
-sprite_image_lo: .byte <(BALL0_VRAM >> 5),            <(BALL1_VRAM >> 5)
-sprite_image_hi: .byte >(BALL0_VRAM >> 5) | SPR_8BPP, >(BALL1_VRAM >> 5) | SPR_8BPP
+sprite_image_lo: .byte <(BALL0_VRAM >> 5)
+                 .byte <(BALL1_VRAM >> 5)
+                 .byte <(BALL2_VRAM >> 5)
+sprite_image_hi: .byte >(BALL0_VRAM >> 5) | SPR_8BPP
+                 .byte >(BALL1_VRAM >> 5) | SPR_8BPP
+                 .byte >(BALL2_VRAM >> 5) | SPR_8BPP
 
 ;==============================================================================
 ; init_balls - starting positions and speeds, from the tables below.
-; Both balls start on the floor, the red one on the left heading right and
-; the blue one on the right heading left, each launched upwards at its own
-; BOUNCE speed. Different speeds put them at different heights when they meet.
+; All the balls start on the floor: the red one on the left heading right,
+; the blue one on the right heading left, and the green one in the middle
+; heading right. Each is launched upwards at its own BOUNCE speed, and the
+; different speeds put them at different heights when they meet.
 ;==============================================================================
 init_balls:
     ldx #0
@@ -568,22 +587,24 @@ init_balls:
     bne @loop
     rts
 
-;                    red ball            blue ball
-start_x_lo:    .byte <X_MIN,             <X_MAX
-start_x_hi:    .byte >X_MIN,             >X_MAX
+X_MIDDLE      = (X_MIN + X_MAX) / 2     ; green ball's starting X (= 144)
+
+;                    red ball            blue ball                  green ball
+start_x_lo:    .byte <X_MIN,             <X_MAX,                    <X_MIDDLE
+start_x_hi:    .byte >X_MIN,             >X_MAX,                    >X_MIDDLE
 ; The blue ball heads left, so its speed is negative: 0 - BLUE_SPEED_X.
-start_vx_frac: .byte <RED_SPEED_X,       <($10000 - BLUE_SPEED_X)
-start_vx:      .byte >RED_SPEED_X,       >($10000 - BLUE_SPEED_X)
+start_vx_frac: .byte <RED_SPEED_X,       <($10000 - BLUE_SPEED_X),  <GREEN_SPEED_X
+start_vx:      .byte >RED_SPEED_X,       >($10000 - BLUE_SPEED_X),  >GREEN_SPEED_X
 ; Upwards is negative, so these are 0 - BOUNCE.
-start_vy_frac: .byte <($10000 - RED_BOUNCE), <($10000 - BLUE_BOUNCE)
-start_vy:      .byte >($10000 - RED_BOUNCE), >($10000 - BLUE_BOUNCE)
+start_vy_frac: .byte <($10000 - RED_BOUNCE), <($10000 - BLUE_BOUNCE), <($10000 - GREEN_BOUNCE)
+start_vy:      .byte >($10000 - RED_BOUNCE), >($10000 - BLUE_BOUNCE), >($10000 - GREEN_BOUNCE)
 
 ;==============================================================================
 ; draw_balls - copy each ball's position into its sprite (attribute bytes 2-5).
 ;
 ; Sprite n's attributes are at $1FC00 + n*8, so its X position (byte 2) is at
-; $1FC00 + n*8 + 2. The top two bytes of that address are the same for both
-; sprites, so only the low byte has to be worked out: n*8 + 2.
+; $1FC00 + n*8 + 2. The top two bytes of that address are the same for all
+; the sprites, so only the low byte has to be worked out: n*8 + 2.
 ;
 ; Only the whole-pixel bytes are used: the fractions are for the physics.
 ; Y never exceeds 255, so its high byte (attribute byte 5) is zero.
@@ -617,13 +638,14 @@ draw_balls:
     rts
 
 ;==============================================================================
-; spin_balls - palette cycling. Recolour both balls' palette entries.
+; spin_balls - palette cycling. Recolour every ball's palette entries.
 ;
 ; Each ball's 64 entries are laid out as  base + shade*16 + slice,
-; and the blue ball's 64 come straight after the red ball's, so we can write
-; all 128 entries (256 bytes) in one pass. That is 8 rows of 16 slices:
-; rows 0-3 are the red ball's shades, rows 4-7 the blue ball's. X counts the
-; rows and also picks the colour from the tables below.
+; and each ball's 64 come straight after the previous ball's, so we can write
+; all 192 entries (384 bytes) in one pass. That is 12 rows of 16 slices:
+; rows 0-3 are the red ball's shades, rows 4-7 the blue ball's and rows 8-11
+; the green ball's. X counts the rows and also picks the colour from the
+; tables below.
 ;
 ; For each slice we work out
 ;
@@ -655,7 +677,7 @@ spin_balls:
     cmp #(BALL_SLICES / 2)
     bcs @white              ; 8-15: white
 
-    lda check_colors_gb,x   ; 0-7: red or blue, in this shade
+    lda check_colors_gb,x   ; 0-7: the ball's colour, in this shade
     sta VERA_data0
     lda check_colors_r,x
     sta VERA_data0
@@ -679,13 +701,17 @@ spin_balls:
 ; The colours for each row (ball*4 + shade, brightest first), split into the
 ; two palette bytes: %GGGGBBBB and %0000RRRR.
 ;                       shade:  0    1    2    3
-check_colors_gb: .byte $00, $00, $00, $00   ; red ball:  no green or blue
-                 .byte $4F, $3C, $29, $16   ; blue ball: blue with a little green
-check_colors_r:  .byte $0F, $0C, $09, $06   ; red ball:  red F, C, 9, 6
-                 .byte $00, $00, $00, $00   ; blue ball: no red
-white_colors_gb: .byte $FF, $CC, $99, $66   ; white (both balls):
+check_colors_gb: .byte $00, $00, $00, $00   ; red ball:   no green or blue
+                 .byte $4F, $3C, $29, $16   ; blue ball:  blue with a little green
+                 .byte $A1, $81, $61, $40   ; green ball: green A, 8, 6, 4, a little blue
+check_colors_r:  .byte $0F, $0C, $09, $06   ; red ball:   red F, C, 9, 6
+                 .byte $00, $00, $00, $00   ; blue ball:  no red
+                 .byte $00, $00, $00, $00   ; green ball: no red
+white_colors_gb: .byte $FF, $CC, $99, $66   ; white (every ball):
                  .byte $FF, $CC, $99, $66   ;   grey levels F, C, 9, 6
+                 .byte $FF, $CC, $99, $66
 white_colors_r:  .byte $0F, $0C, $09, $06
+                 .byte $0F, $0C, $09, $06
                  .byte $0F, $0C, $09, $06
 
 ;==============================================================================
@@ -885,12 +911,36 @@ reverse_x:
     rts
 
 ;==============================================================================
-; check_collision - make the two balls bounce off each other.
+; check_collisions - bounce any balls that are touching off each other.
 ;
-; Only called when VERA has reported that the sprites overlapped (see
-; main_loop). VERA's report is about the frame it has just drawn, and it
-; counts any overlapping pixels, so we still check the distance ourselves
-; using the balls' current positions.
+; Only called when VERA has reported that some sprites overlapped (see
+; main_loop). VERA doesn't say which ones, so we try every pair of balls:
+; with 3 balls that is 0-1, 0-2 and 1-2. (With N balls it is N*(N-1)/2.)
+;==============================================================================
+check_collisions:
+    stz ball_a
+@outer:
+    lda ball_a              ; ball_b runs from ball_a + 1 up to the last ball
+    inc a
+    sta ball_b
+@inner:
+    jsr check_pair
+    inc ball_b
+    lda ball_b
+    cmp #NUM_BALLS
+    bne @inner
+    inc ball_a
+    lda ball_a
+    cmp #(NUM_BALLS - 1)    ; the last ball has no one left to pair with
+    bne @outer
+    rts
+
+;------------------------------------------------------------------------------
+; check_pair - make balls ball_a and ball_b bounce off each other if touching.
+;
+; VERA's report is about the frame it has just drawn, and it counts any
+; overlapping pixels, so we check the distance ourselves using the balls'
+; current positions.
 ;
 ; 1. DETECT. The balls touch when the distance between their centres is less
 ;    than COLLIDE_DIST (32). By Pythagoras that distance is
@@ -898,7 +948,7 @@ reverse_x:
 ;    squares instead:   dx*dx + dy*dy < 32*32
 ;    The squares come from a lookup table, so no multiplying is needed.
 ;    (Comparing top left corners gives the same dx and dy as comparing the
-;    centres, because both sprites are the same size.)
+;    centres, because all the sprites are the same size.)
 ;
 ; 2. RESPOND. When two equal balls collide they swap their speeds along the
 ;    line joining their centres; speeds across that line don't change.
@@ -912,25 +962,29 @@ reverse_x:
 ;    swapped speeds they are moving apart, so they won't swap back on the
 ;    next frame while they are still overlapping.
 ;
-; This routine works on balls 0 and 1, so it uses "name" for ball 0 and
-; "name+1" for ball 1 rather than the X register.
-;==============================================================================
-check_collision:
-    ; ---- dx = ball 1's X - ball 0's X (16-bit) -----------------------------
-    sec
-    lda pos_x_lo+1
-    sbc pos_x_lo
-    sta dx_lo
-    lda pos_x_hi+1
-    sbc pos_x_hi
-    sta dx_hi               ; bit 7 = sign: set if ball 1 is left of ball 0
+; X holds ball a and Y holds ball b, so "pos_x_lo,x" is ball a's X and
+; "pos_x_lo,y" is ball b's. (Y is also used by small_abs and the square
+; table lookup, so we reload X and Y from ball_a and ball_b afterwards.)
+;------------------------------------------------------------------------------
+check_pair:
+    ldx ball_a
+    ldy ball_b
 
-    ; ---- dy = ball 1's Y - ball 0's Y (16-bit) -----------------------------
+    ; ---- dx = ball b's X - ball a's X (16-bit) -----------------------------
+    sec
+    lda pos_x_lo,y
+    sbc pos_x_lo,x
+    sta dx_lo
+    lda pos_x_hi,y
+    sbc pos_x_hi,x
+    sta dx_hi               ; bit 7 = sign: set if ball b is left of ball a
+
+    ; ---- dy = ball b's Y - ball a's Y (16-bit) -----------------------------
     ; Y fits in one byte, but the difference can be -204 to +204, which
     ; doesn't, so we make it 16 bits by subtracting the (zero) high bytes.
     sec
-    lda pos_y+1
-    sbc pos_y
+    lda pos_y,y
+    sbc pos_y,x
     sta dy_lo
     lda #0
     sbc #0                  ; 0 - 0 - borrow: $FF if negative, $00 if not
@@ -941,14 +995,18 @@ check_collision:
     lda dx_lo
     ldy dx_hi
     jsr small_abs
-    bcs @no_hit
+    bcs @reject
     sta dist_x
 
     lda dy_lo
     ldy dy_hi
     jsr small_abs
-    bcs @no_hit
+    bcs @reject
     sta dist_y
+    bra @close              ; close enough on both axes: measure properly
+@reject:
+    rts                     ; (here so the branches above can reach it)
+@close:
 
     ; ---- dist_sq = dist_x squared + dist_y squared (16-bit) -----------------
     ldx dist_x
@@ -969,6 +1027,8 @@ check_collision:
     bcs @no_hit             ; carry set: dist_sq >= limit, not touching
 
     ; ==== They are touching. ====
+    ldx ball_a              ; X and Y back to the two balls
+    ldy ball_b
 
     ; ---- Swap X speeds? Not if they are mostly one above the other,
     ;      i.e. only if 2*|dx| >= |dy|. ----------------------------------------
@@ -977,27 +1037,31 @@ check_collision:
     cmp dist_y
     bcc @try_y              ; 2*|dx| < |dy|: skip X
 
-    ; Are they approaching along X? Ball 1's speed relative to ball 0 is
-    ; vel_x+1 - vel_x. They are approaching if that has the OPPOSITE sign to
-    ; dx (e.g. ball 1 is to the right and moving left relative to ball 0).
+    ; Are they approaching along X? Ball b's speed relative to ball a is
+    ; vel_x(b) - vel_x(a). They are approaching if that has the OPPOSITE sign
+    ; to dx (e.g. ball b is to the right and moving left relative to ball a).
     ; EOR of the two high bytes sets bit 7 exactly when the signs differ.
     sec
-    lda vel_x_frac+1        ; low bytes: we only need the borrow
-    sbc vel_x_frac
-    lda vel_x+1
-    sbc vel_x               ; A = high byte of the relative speed
+    lda vel_x_frac,y        ; low bytes: we only need the borrow
+    sbc vel_x_frac,x
+    lda vel_x,y
+    sbc vel_x,x             ; A = high byte of the relative speed
     eor dx_hi
     bpl @try_y              ; same sign: moving apart, leave them be
 
-    ; Swap: A and Y hold the two values while we cross them over.
-    lda vel_x_frac
-    ldy vel_x_frac+1
-    sta vel_x_frac+1
-    sty vel_x_frac
-    lda vel_x
-    ldy vel_x+1
-    sta vel_x+1
-    sty vel_x
+    ; Swap, using swap_tmp to hold ball a's byte while we cross them over.
+    lda vel_x_frac,x
+    sta swap_tmp
+    lda vel_x_frac,y
+    sta vel_x_frac,x
+    lda swap_tmp
+    sta vel_x_frac,y
+    lda vel_x,x
+    sta swap_tmp
+    lda vel_x,y
+    sta vel_x,x
+    lda swap_tmp
+    sta vel_x,y
 
 @try_y:
     ; ---- Swap Y speeds? Only if 2*|dy| >= |dx|. ---------------------------
@@ -1007,21 +1071,25 @@ check_collision:
     bcc @no_hit
 
     sec                     ; approaching along Y? (as for X)
-    lda vel_y_frac+1
-    sbc vel_y_frac
-    lda vel_y+1
-    sbc vel_y
+    lda vel_y_frac,y
+    sbc vel_y_frac,x
+    lda vel_y,y
+    sbc vel_y,x
     eor dy_hi
     bpl @no_hit
 
-    lda vel_y_frac
-    ldy vel_y_frac+1
-    sta vel_y_frac+1
-    sty vel_y_frac
-    lda vel_y
-    ldy vel_y+1
-    sta vel_y+1
-    sty vel_y
+    lda vel_y_frac,x
+    sta swap_tmp
+    lda vel_y_frac,y
+    sta vel_y_frac,x
+    lda swap_tmp
+    sta vel_y_frac,y
+    lda vel_y,x
+    sta swap_tmp
+    lda vel_y,y
+    sta vel_y,x
+    lda swap_tmp
+    sta vel_y,y
 
 @no_hit:
     rts
